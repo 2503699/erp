@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>員工出勤管理系統</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js';
+        import { getFirestore, collection, doc, setDoc, getDocs, updateDoc, deleteDoc, addDoc, onSnapshot, query, where } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
+        import { getAuth, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js';
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyDwb-QTbwdVgQ2rLWekv70xY5Nk2YkHiak",
+            authDomain: "lee-erp-c38bf.firebaseapp.com",
+            projectId: "lee-erp-c38bf",
+            storageBucket: "lee-erp-c38bf.firebasestorage.app",
+            messagingSenderId: "1085101558311",
+            appId: "1:1085101558311:web:4207f31dc3b2656d091c02",
+            measurementId: "G-LFSV2SB4B8"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+
+        window.firebaseDB = db;
+        window.firebaseAuth = auth;
+        window.firebaseModules = {
+            collection, doc, setDoc, getDocs, updateDoc, deleteDoc, addDoc, onSnapshot, query, where
+        };
+
+        signInAnonymously(auth).catch(err => console.error("Auth error:", err));
+    </script>
+
+    <style>
+        * { -webkit-tap-highlight-color: transparent; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .animate-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        #loading-screen {
+            position: fixed;
+            inset: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
+    <div id="loading-screen">
+        <div class="text-center">
+            <div class="text-white text-3xl font-black mb-4 animate-pulse">載入中...</div>
+            <div class="text-white/80 text-sm">正在連接雲端數據庫</div>
+        </div>
+    </div>
+
+    <div id="app"></div>
+
+    <script>
+        class App {
+            constructor() {
+                this.db = window.firebaseDB;
+                this.auth = window.firebaseAuth;
+                this.modules = window.firebaseModules;
+                
+                this.view = 'attendance';
+                this.selectedDate = new Date().toISOString().split('T')[0];
+                
+                const now = new Date();
+                this.reportStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+                this.reportEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split('T')[0];
+                this.statsYear = now.getFullYear();
+                this.expandedEmp = null;
+
+                this.modals = { employee: false, adjustment: false, loan: false };
+                this.currentEmp = { name: '', dailyRate: 0, status: 'active' };
+                this.currentAdj = { empId: '', empName: '', amount: 0, note: '' };
+                this.currentLoan = { empId: '', amount: '', date: new Date().toISOString().split('T')[0], note: '' };
+
+                this.employees = [];
+                this.attendance = {};
+                this.adjustments = {};
+                this.loans = [];
+
+                this.initFirebase();
+            }
+
+            async initFirebase() {
+                this.auth.onAuthStateChanged(async (user) => {
+                    if (user) {
+                        console.log('已登入:', user.uid);
+                        await this.setupRealtimeListeners();
+                        setTimeout(() => {
+                            document.getElementById('loading-screen').style.display = 'none';
+                        }, 500);
+                    }
+                });
+            }
+
+            async setupRealtimeListeners() {
+                const { collection, onSnapshot } = this.modules;
+
+                onSnapshot(collection(this.db, 'employees'), (snapshot) => {
+                    this.employees = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    this.render();
+                });
+
+                onSnapshot(collection(this.db, 'attendance'), (snapshot) => {
+                    this.attendance = {};
+                    snapshot.docs.forEach(doc => {
+                        this.attendance[doc.id] = doc.data().present || {};
+                    });
+                    this.render();
+                });
+
+                onSnapshot(collection(this.db, 'adjustments'), (snapshot) => {
+                    this.adjustments = {};
+                    snapshot.docs.forEach(doc => {
+                        this.adjustments[doc.id] = doc.data();
+                    });
+                    this.render();
+                });
+
+                onSnapshot(collection(this.db, 'loans'), (snapshot) => {
+                    this.loans = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    this.render();
+                });
+            }
+
+            render() {
+                const app = document.getElementById('app');
+                if (!app) return;
+                
+                app.innerHTML = `
+                    <div class="p-2 sm:p-6">
+                        ${this.renderHeader()}
+                        ${this.renderNav()}
+                        <main class="max-w-6xl mx-auto">
+                            ${this.renderContent()}
+                        </main>
+                    </div>
+                    ${this.renderModals()}
+                `;
+                this.attachEventListeners();
+            }
+
+            renderHeader() {
+                return `
+                    <header class="mb-6 sm:mb-8">
+                        <div class="max-w-6xl mx-auto bg-white p-4 sm:p-6 rounded-3xl shadow-lg border-l-8 border-blue-600">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <div>
+                                    <h1 class="text-2xl sm:text-3xl font-black bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">員工出勤管理系統</h1>
+                                    <p class="text-xs sm:text-sm text-gray-500 mt-1">☁️ 雲端同步 · 多裝置共用</p>
+                                </div>
+                                <div class="flex items-center gap-2 text-xs sm:text-sm">
+                                    <div class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
+                                    <span class="font-bold text-gray-600">雲端已連線</span>
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+                `;
+            }
+
+            renderNav() {
+                const navItems = [
+                    { id: 'attendance', label: '每日出勤', icon: '📅' },
+                    { id: 'report', label: '薪資結算', icon: '💰' },
+                    { id: 'loans', label: '借支管理', icon: '💳' },
+                    { id: 'stats', label: '年度統計', icon: '📊' },
+                    { id: 'employees', label: '員工管理', icon: '👥' }
+                ];
+
+                return `
+                    <nav class="max-w-6xl mx-auto mb-6 bg-white p-2 rounded-2xl shadow-md flex flex-wrap gap-2">
+                        ${navItems.map(item => `
+                            <button onclick="app.setView('${item.id}')" class="flex-1 min-w-[80px] sm:min-w-0 py-3 px-2 sm:px-4 rounded-xl font-bold flex items-center justify-center gap-2 transition-all text-xs sm:text-sm ${
+                                this.view === item.id ? 'bg-blue-600 text-white shadow-lg scale-105' : 'text-gray-600 hover:bg-gray-100'
+                            }">
+                                <span class="text-base">${item.icon}</span>
+                                <span class="hidden sm:inline">${item.label}</span>
+                            </button>
+                        `).join('')}
+                    </nav>
+                `;
+            }
+
+            renderContent() {
+                switch(this.view) {
+                    case 'attendance': return this.renderAttendance();
+                    case 'report': return this.renderReport();
+                    case 'loans': return this.renderLoans();
+                    case 'stats': return this.renderStats();
+                    case 'employees': return this.renderEmployees();
+                }
+            }
+
+            renderAttendance() {
+                const employees = this.employees.filter(e => e.status === 'active').sort((a, b) => a.name.localeCompare(b.name));
+                
+                return `
+                    <div class="space-y-4">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-blue-600">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <h2 class="text-lg sm:text-xl font-bold">出勤打卡</h2>
+                                <input type="date" id="selectedDate" value="${this.selectedDate}" class="bg-gray-50 p-2 sm:p-3 rounded-xl font-bold border-2 border-gray-200 outline-none text-sm sm:text-base w-full sm:w-auto" />
+                            </div>
+                        </div>
+
+                        <div class="grid gap-3">
+                            ${employees.map(emp => {
+                                const isPresent = this.attendance[emp.id]?.[this.selectedDate] || false;
+                                return `
+                                    <button onclick="app.toggleAttendance('${emp.id}')" class="p-4 sm:p-6 rounded-2xl font-bold flex justify-between items-center transition-all shadow-lg text-left ${
+                                        isPresent ? 'bg-gradient-to-r from-emerald-500 to-green-600 text-white scale-[1.02]' : 'bg-white text-gray-700 hover:shadow-xl'
+                                    }">
+                                        <div class="flex items-center gap-3 sm:gap-4">
+                                            <div class="w-12 h-12 sm:w-14 sm:h-14 rounded-xl flex items-center justify-center font-black text-lg sm:text-xl ${isPresent ? 'bg-white/20' : 'bg-blue-50 text-blue-600'}">
+                                                ${emp.name.charAt(0)}
+                                            </div>
+                                            <div>
+                                                <div class="text-base sm:text-lg">${emp.name}</div>
+                                                <div class="text-xs ${isPresent ? 'text-white/80' : 'text-gray-400'}">日薪 $${emp.dailyRate}</div>
+                                            </div>
+                                        </div>
+                                        ${isPresent ? '<span class="text-2xl">✓</span>' : '<div class="w-6 h-6 sm:w-7 sm:h-7 rounded-full border-2 border-gray-300"></div>'}
+                                    </button>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderReport() {
+                const reportData = this.calculateReport();
+                
+                return `
+                    <div class="space-y-4 sm:space-y-6">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-emerald-600">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <h2 class="text-lg sm:text-xl font-bold">薪資結算</h2>
+                                <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                                    <input type="date" id="reportStart" value="${this.reportStart}" class="bg-gray-50 p-2 sm:p-3 rounded-xl font-bold border-2 border-gray-200 outline-none text-xs sm:text-sm" />
+                                    <span class="hidden sm:flex items-center text-gray-400 font-bold">至</span>
+                                    <input type="date" id="reportEnd" value="${this.reportEnd}" class="bg-gray-50 p-2 sm:p-3 rounded-xl font-bold border-2 border-gray-200 outline-none text-xs sm:text-sm" />
+                                    <button onclick="app.downloadReportExcel()" class="bg-emerald-600 text-white px-3 sm:px-4 py-2 sm:py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg text-xs sm:text-sm justify-center">
+                                        <span>📊</span> Excel
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="space-y-3">
+                            ${reportData.map(d => `
+                                <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border border-gray-100">
+                                    <div class="flex justify-between items-start mb-4">
+                                        <div class="flex items-center gap-3 sm:gap-4">
+                                            <div class="w-10 h-10 sm:w-12 sm:h-12 bg-gradient-to-br from-blue-500 to-indigo-600 text-white rounded-xl flex items-center justify-center font-black text-base sm:text-lg">${d.name.charAt(0)}</div>
+                                            <div>
+                                                <div class="font-bold text-base sm:text-lg">${d.name}</div>
+                                                <div class="text-xs text-gray-400">日薪 $${d.dailyRate} × ${d.days} 天</div>
+                                            </div>
+                                        </div>
+                                        <button onclick="app.openAdjustment('${d.id}', '${d.name}', ${d.adj})" class="text-emerald-600 p-2 hover:bg-emerald-50 rounded-lg transition-colors" title="薪資調整">
+                                            ⚙️
+                                        </button>
+                                    </div>
+
+                                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                                        <div class="bg-blue-50 p-3 rounded-xl">
+                                            <div class="text-xs text-gray-500 font-bold">基本薪資</div>
+                                            <div class="text-base sm:text-lg font-black text-blue-600">$${d.baseSalary}</div>
+                                        </div>
+                                        <div class="bg-emerald-50 p-3 rounded-xl">
+                                            <div class="text-xs text-gray-500 font-bold">調整金額</div>
+                                            <div class="text-base sm:text-lg font-black text-emerald-600">${d.adj >= 0 ? '+' : ''}${d.adj}</div>
+                                        </div>
+                                        <div class="bg-amber-50 p-3 rounded-xl">
+                                            <div class="text-xs text-gray-500 font-bold">借支扣款</div>
+                                            <div class="text-base sm:text-lg font-black text-amber-600">-$${d.totalLoans}</div>
+                                        </div>
+                                        <div class="bg-gradient-to-br from-indigo-500 to-purple-600 p-3 rounded-xl">
+                                            <div class="text-xs text-white/80 font-bold">實發薪資</div>
+                                            <div class="text-base sm:text-lg font-black text-white">$${d.finalSalary}</div>
+                                        </div>
+                                    </div>
+
+                                    ${d.empLoans.length > 0 ? `
+                                        <div class="border-t pt-3">
+                                            <div class="text-xs font-bold text-gray-400 mb-2">借支明細：</div>
+                                            <div class="space-y-1">
+                                                ${d.empLoans.map(loan => `
+                                                    <div class="text-xs text-gray-600 flex justify-between">
+                                                        <span>${loan.date} - ${loan.note || '無備註'}</span>
+                                                        <span class="font-bold">$${loan.amount}</span>
+                                                    </div>
+                                                `).join('')}
+                                            </div>
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderLoans() {
+                const loans = this.loans.sort((a, b) => b.timestamp - a.timestamp);
+                
+                return `
+                    <div class="space-y-4 sm:space-y-6">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-amber-600">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <h2 class="text-lg sm:text-xl font-bold">借支記錄</h2>
+                                <button onclick="app.openLoanModal()" class="bg-amber-500 text-white px-4 py-2 sm:py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg text-sm w-full sm:w-auto justify-center">
+                                    <span>➕</span> 新增借支
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="space-y-3">
+                            ${loans.map(loan => `
+                                <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                                    <div class="flex items-center gap-3 sm:gap-4 w-full sm:w-auto">
+                                        <div class="w-10 h-10 sm:w-12 sm:h-12 bg-amber-50 text-amber-600 rounded-xl flex items-center justify-center font-black text-base sm:text-lg">${loan.empName.charAt(0)}</div>
+                                        <div class="flex-1">
+                                            <div class="font-bold text-base sm:text-lg">${loan.empName}</div>
+                                            <div class="text-xs text-gray-400">${loan.date} - ${loan.note || '無備註'}</div>
+                                        </div>
+                                    </div>
+                                    <div class="flex items-center gap-3 sm:gap-4 w-full sm:w-auto justify-between sm:justify-end">
+                                        <div class="text-xl sm:text-2xl font-black text-amber-600">$${loan.amount}</div>
+                                        <button onclick="app.deleteLoan('${loan.id}')" class="text-red-400 hover:text-red-600 transition-colors p-2">🗑️</button>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderStats() {
+                const statsData = this.calculateStats();
+                
+                return `
+                    <div class="space-y-4 sm:space-y-6">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-indigo-600">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <h2 class="text-lg sm:text-xl font-bold">年度統計</h2>
+                                <div class="flex gap-2 w-full sm:w-auto">
+                                    <select id="statsYear" class="bg-gray-50 p-2 sm:p-3 rounded-xl font-bold border-2 border-gray-200 outline-none text-sm sm:text-base flex-1 sm:flex-none">
+                                        ${Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - i).map(y => `
+                                            <option value="${y}" ${y === this.statsYear ? 'selected' : ''}>${y} 年</option>
+                                        `).join('')}
+                                    </select>
+                                    <button onclick="app.downloadStatsExcel()" class="bg-emerald-600 text-white px-3 sm:px-4 py-2 sm:py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg text-xs sm:text-sm justify-center">
+                                        <span>📊</span> Excel
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="space-y-4">
+                            ${statsData.map(emp => `
+                                <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                                    <div onclick="app.toggleExpand('${emp.id}')" class="p-4 sm:p-6 flex justify-between items-center cursor-pointer hover:bg-gray-50 transition">
+                                        <div class="flex items-center gap-3 sm:gap-4">
+                                            <div class="w-10 h-10 sm:w-12 sm:h-12 bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center font-black text-base sm:text-lg">${emp.name.charAt(0)}</div>
+                                            <div>
+                                                <div class="font-bold text-base sm:text-lg">${emp.name}</div>
+                                                <div class="text-xs text-gray-400">全年共 ${emp.totalDays} 天</div>
+                                            </div>
+                                        </div>
+                                        <div class="flex items-center gap-3">
+                                            <div class="text-xl sm:text-2xl font-black text-indigo-600">${emp.totalDays} 天</div>
+                                            <span>${this.expandedEmp === emp.id ? '▲' : '▼'}</span>
+                                        </div>
+                                    </div>
+                                    ${this.expandedEmp === emp.id ? `
+                                        <div class="p-4 bg-gray-50 grid grid-cols-3 sm:grid-cols-6 gap-2 border-t">
+                                            ${emp.monthlyData.map(m => `
+                                                <div class="p-2 bg-white rounded-lg border text-center">
+                                                    <div class="text-[10px] text-gray-400 font-bold">${m.month}月</div>
+                                                    <div class="text-sm font-bold">${m.days}天</div>
+                                                </div>
+                                            `).join('')}
+                                        </div>
+                                    ` : ''}
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderEmployees() {
+                const activeEmployees = this.employees.filter(e => e.status === 'active').sort((a, b) => a.name.localeCompare(b.name));
+                const inactiveEmployees = this.employees.filter(e => e.status === 'inactive').sort((a, b) => a.name.localeCompare(b.name));
+                
+                return `
+                    <div class="space-y-6">
+                        <div class="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border-l-8 border-gray-800 space-y-4">
+                            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                                <h2 class="text-lg sm:text-xl font-bold">員工清單</h2>
+                                <div class="flex flex-wrap gap-2 w-full sm:w-auto">
+                                    <button onclick="app.downloadTemplate()" class="text-blue-500 p-2 hover:bg-blue-50 rounded-lg flex items-center gap-1 text-xs font-bold border border-blue-200">
+                                        📥 下載範例
+                                    </button>
+                                    <button onclick="document.getElementById('csvImport').click()" class="text-emerald-500 p-2 hover:bg-emerald-50 rounded-lg flex items-center gap-1 text-xs font-bold border border-emerald-200">
+                                        📤 批次匯入
+                                    </button>
+                                    <input type="file" id="csvImport" accept=".csv,.xlsx,.xls" style="display:none" />
+                                    <button onclick="app.openEmployeeModal()" class="bg-black text-white px-3 sm:px-4 py-2 rounded-xl font-bold flex items-center gap-2 shadow-lg text-sm flex-1 sm:flex-none justify-center">
+                                        ➕ 新增人員
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="space-y-2">
+                            <div class="text-xs font-black text-blue-500 px-4 uppercase tracking-widest flex items-center gap-2">
+                                <div class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>
+                                在職中 (${activeEmployees.length})
+                            </div>
+                            ${activeEmployees.map(emp => `
+                                <div class="bg-white p-4 rounded-2xl flex justify-between items-center shadow-sm border border-transparent hover:border-blue-200 transition group">
+                                    <div class="flex items-center gap-3 sm:gap-4">
+                                        <div class="w-10 h-10 sm:w-12 sm:h-12 bg-blue-50 text-blue-600 rounded-xl flex items-center justify-center font-black group-hover:scale-110 transition text-base sm:text-lg">${emp.name.charAt(0)}</div>
+                                        <div>
+                                            <div class="font-bold text-base sm:text-lg">${emp.name}</div>
+                                            <div class="text-xs text-gray-400 font-bold flex items-center gap-2">日薪 $${emp.dailyRate} <span class="text-[10px] px-1 bg-blue-50 text-blue-400 rounded">在職</span></div>
+                                        </div>
+                                    </div>
+                                    <div class="flex items-center gap-2 sm:gap-3">
+                                        <button onclick="app.toggleStatus('${emp.id}')" class="p-2 text-gray-300 hover:text-orange-500 transition-colors" title="標記為離職">👤</button>
+                                        <button onclick="app.deleteEmployee('${emp.id}', '${emp.name}')" class="p-2 text-gray-300 hover:text-red-500 transition-colors" title="徹底刪除">🗑️</button>
+                                        <button onclick="app.editEmployee('${emp.id}')" class="p-2 text-gray-300 hover:text-blue-500 transition-colors" title="修改">✏️</button>
+                                    </div>
+                                </div>
+                            `).join('')}
+
+                            <div class="text-xs font-black text-gray-400 px-4 mt-8 uppercase tracking-widest flex items-center gap-2">
+                                <div class="w-2 h-2 rounded-full bg-gray-300"></div>
+                                已離職 (${inactiveEmployees.length})
+                            </div>
+                            ${inactiveEmployees.map(emp => `
+                                <div class="bg-gray-100/50 p-4 rounded-2xl flex justify-between items-center opacity-60 hover:opacity-100 transition group">
+                                    <div class="flex items-center gap-3 sm:gap-4 grayscale">
+                                        <div class="w-10 h-10 sm:w-12 sm:h-12 bg-gray-200 text-gray-500 rounded-xl flex items-center justify-center font-black text-base sm:text-lg">${emp.name.charAt(0)}</div>
+                                        <div>
+                                            <div class="text-gray-500 font-bold text-base sm:text-lg">${emp.name}</div>
+                                            <div class="text-[10px] px-1 bg-gray-200 text-gray-400 rounded inline-block font-bold">已離職</div>
+                                        </div>
+                                    </div>
+                                    <div class="flex items-center gap-2 sm:gap-3">
+                                        <button onclick="app.toggleStatus('${emp.id}')" class="p-2 text-gray-400 hover:text-emerald-500 transition-colors" title="恢復在職">✓</button>
+                                        <button onclick="app.deleteEmployee('${emp.id}', '${emp.name}')" class="p-2 text-gray-400 hover:text-red-500 transition-colors" title="徹底刪除">🗑️</button>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderModals() {
+                return `
+                    ${this.modals.employee ? this.renderEmployeeModal() : ''}
+                    ${this.modals.adjustment ? this.renderAdjustmentModal() : ''}
+                    ${this.modals.loan ? this.renderLoanModal() : ''}
+                `;
+            }
+
+            renderEmployeeModal() {
+                return `
+                    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <div class="bg-white rounded-3xl p-6 sm:p-8 w-full max-w-sm shadow-2xl space-y-6">
+                            <h3 class="text-xl sm:text-2xl font-black text-center">修改員工資訊</h3>
+                            <div class="space-y-4">
+                                <div>
+                                    <label class="text-xs text-gray-500 font-bold block mb-2">員工姓名</label>
+                                    <input type="text" id="empName" value="${this.currentEmp.name}" class="w-full bg-gray-50 p-3 sm:p-4 rounded-2xl font-bold outline-none border-2 border-gray-100 text-sm sm:text-base" placeholder="員工姓名" />
+                                </div>
+                                <div>
+                                    <label class="text-xs text-gray-500 font-bold block mb-2">日薪</label>
+                                    <input type="number" id="empRate" value="${this.currentEmp.dailyRate}" class="w-full bg-gray-50 p-3 sm:p-4 rounded-2xl font-bold outline-none border-2 border-gray-100 text-sm sm:text-base" placeholder="1000" />
+                                </div>
+                                ${this.currentEmp.id ? `
+                                    <div class="flex items-center justify-between p-3 sm:p-4 bg-gray-50 rounded-2xl border-2 border-gray-100">
+                                        <span class="text-sm font-bold text-gray-600">在職狀態</span>
+                                        <button onclick="app.toggleCurrentEmpStatus()" class="px-3 sm:px-4 py-2 rounded-xl font-bold text-white transition-all text-sm ${this.currentEmp.status === 'active' ? 'bg-emerald-500 hover:bg-emerald-600' : 'bg-gray-400 hover:bg-gray-500'}">
+                                            ${this.currentEmp.status === 'active' ? '在職中' : '已離職'}
+                                        </button>
+                                    </div>
+                                ` : ''}
+                            </div>
+                            <div class="flex gap-3">
+                                <button onclick="app.closeModal('employee')" class="flex-1 py-3 sm:py-4 font-bold text-gray-400 text-sm sm:text-base">取消</button>
+                                <button onclick="app.saveEmployee()" class="flex-1 bg-blue-600 text-white py-3 sm:py-4 rounded-2xl font-bold shadow-lg text-sm sm:text-base">儲存</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderAdjustmentModal() {
+                return `
+                    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <div class="bg-white rounded-3xl p-6 sm:p-8 w-full max-w-sm shadow-2xl space-y-4">
+                            <h3 class="text-lg sm:text-xl font-bold text-center">調整 ${this.currentAdj.empName} 薪資</h3>
+                            <p class="text-xs text-gray-400 text-center">此調整僅針對目前的結算週期</p>
+                            <input type="number" id="adjAmount" value="${this.currentAdj.amount}" class="w-full bg-gray-50 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" placeholder="調整金額 (可為負數)" />
+                            <input type="text" id="adjNote" value="${this.currentAdj.note}" class="w-full bg-gray-50 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" placeholder="調整原因" />
+                            <div class="flex gap-3 pt-4">
+                                <button onclick="app.closeModal('adjustment')" class="flex-1 font-bold text-gray-400 text-sm sm:text-base">取消</button>
+                                <button onclick="app.saveAdjustment()" class="flex-1 bg-emerald-600 text-white py-3 sm:py-4 rounded-2xl font-bold text-sm sm:text-base">確認調整</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            renderLoanModal() {
+                const activeEmployees = this.employees.filter(e => e.status === 'active');
+                
+                return `
+                    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <div class="bg-white rounded-3xl p-6 sm:p-8 w-full max-w-sm shadow-2xl space-y-6">
+                            <h3 class="text-xl sm:text-2xl font-black text-center text-amber-600">新增預支/借支</h3>
+                            <div class="space-y-4">
+                                <select id="loanEmpId" class="w-full bg-gray-50 border-2 border-gray-100 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base">
+                                    <option value="">選擇員工...</option>
+                                    ${activeEmployees.map(e => `
+                                        <option value="${e.id}" ${e.id === this.currentLoan.empId ? 'selected' : ''}>${e.name}</option>
+                                    `).join('')}
+                                </select>
+                                <input type="number" id="loanAmount" value="${this.currentLoan.amount}" class="w-full bg-gray-50 border-2 border-gray-100 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" placeholder="輸入金額" />
+                                <input type="date" id="loanDate" value="${this.currentLoan.date}" class="w-full bg-gray-50 border-2 border-gray-100 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" />
+                                <input type="text" id="loanNote" value="${this.currentLoan.note}" class="w-full bg-gray-50 border-2 border-gray-100 p-3 sm:p-4 rounded-2xl font-bold outline-none text-sm sm:text-base" placeholder="備註 (如：生活費)" />
+                            </div>
+                            <div class="flex gap-3">
+                                <button onclick="app.closeModal('loan')" class="flex-1 py-3 sm:py-4 font-bold text-gray-400 text-sm sm:text-base">取消</button>
+                                <button onclick="app.saveLoan()" class="flex-1 bg-amber-500 text-white py-3 sm:py-4 rounded-2xl font-bold shadow-lg text-sm sm:text-base">確認借支</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            attachEventListeners() {
+                const sd = document.getElementById('selectedDate');
+                if (sd) sd.onchange = (e) => { this.selectedDate = e.target.value; this.render(); };
+                
+                const rs = document.getElementById('reportStart');
+                if (rs) rs.onchange = (e) => { this.reportStart = e.target.value; this.render(); };
+                
+                const re = document.getElementById('reportEnd');
+                if (re) re.onchange = (e) => { this.reportEnd = e.target.value; this.render(); };
+                
+                const sy = document.getElementById('statsYear');
+                if (sy) sy.onchange = (e) => { this.statsYear = Number(e.target.value); this.render(); };
+                
+                const csvImport = document.getElementById('csvImport');
+                if (csvImport) csvImport.onchange = (e) => this.handleImport(e);
+            }
+
+            setView(view) { this.view = view; this.render(); }
+            toggleExpand(empId) { this.expandedEmp = this.expandedEmp === empId ? null : empId; this.render(); }
+            closeModal(type) { this.modals[type] = false; this.render(); }
+
+            async toggleAttendance(empId) {
+                const { doc, setDoc } = this.modules;
+                const isPresent = this.attendance[empId]?.[this.selectedDate] || false;
+                await setDoc(doc(this.db, 'attendance', empId), { 
+                    present: { ...this.attendance[empId], [this.selectedDate]: !isPresent } 
+                }, { merge: true });
+            }
+
+            openEmployeeModal() { 
+                this.currentEmp = { name: '', dailyRate: 0, status: 'active' }; 
+                this.modals.employee = true; 
+                this.render(); 
+            }
+            
+            editEmployee(id) { 
+                const emp = this.employees.find(e => e.id === id); 
+                if (emp) { 
+                    this.currentEmp = { ...emp }; 
+                    this.modals.employee = true; 
+                    this.render(); 
+                } 
+            }
+            
+            async saveEmployee() {
+                const name = document.getElementById('empName').value.trim();
+                const rate = document.getElementById('empRate').value;
+                if (!name || !rate) return alert('請填寫完整資料');
+                
+                const { collection, doc, addDoc, updateDoc } = this.modules;
+                
+                if (this.currentEmp.id) {
+                    await updateDoc(doc(this.db, 'employees', this.currentEmp.id), { 
+                        name, 
+                        dailyRate: Number(rate),
+                        status: this.currentEmp.status
+                    });
+                } else {
+                    await addDoc(collection(this.db, 'employees'), { 
+                        name, 
+                        dailyRate: Number(rate), 
+                        status: 'active', 
+                        createdAt: Date.now() 
+                    });
+                }
+                this.closeModal('employee');
+            }
+
+            toggleCurrentEmpStatus() {
+                this.currentEmp.status = this.currentEmp.status === 'active' ? 'inactive' : 'active';
+                this.render();
+            }
+
+            async toggleStatus(id) {
+                const emp = this.employees.find(e => e.id === id);
+                if (!emp) return;
+
+                const newStatus = emp.status === 'active' ? 'inactive' : 'active';
+                const confirmMsg = newStatus === 'inactive' ? 
+                    `確定要將「${emp.name}」標記為離職嗎？` : 
+                    `確定要將「${emp.name}」恢復為在職嗎？`;
+                
+                if (confirm(confirmMsg)) {
+                    const { doc, updateDoc } = this.modules;
+                    await updateDoc(doc(this.db, 'employees', id), { status: newStatus });
+                }
+            }
+
+            async deleteEmployee(id, name) {
+                if (confirm(`⚠️ 嚴重警告！\n\n您確定要「徹底刪除」員工：${name} 嗎？\n\n這將移除該員工的所有個人基本資料，且無法復原。\n建議若只是該員工目前沒上班，使用「離職」功能即可。`)) {
+                    const { doc, deleteDoc, collection, query, where, getDocs } = this.modules;
+                    
+                    await deleteDoc(doc(this.db, 'employees', id));
+                    
+                    const loansQuery = query(collection(this.db, 'loans'), where('empId', '==', id));
+                    const loansSnapshot = await getDocs(loansQuery);
+                    loansSnapshot.forEach(async (loanDoc) => {
+                        await deleteDoc(loanDoc.ref);
+                    });
+                }
+            }
+
+            openAdjustment(empId, empName, amount) { 
+                this.currentAdj = { empId, empName, amount, note: '' }; 
+                this.modals.adjustment = true; 
+                this.render(); 
+            }
+            
+            async saveAdjustment() {
+                const amount = document.getElementById('adjAmount').value;
+                const note = document.getElementById('adjNote').value;
+                const key = `${this.reportStart}_${this.reportEnd}_${this.currentAdj.empId}`;
+                
+                const { doc, setDoc } = this.modules;
+                await setDoc(doc(this.db, 'adjustments', key), {
+                    empId: this.currentAdj.empId, 
+                    empName: this.currentAdj.empName,
+                    amount: Number(amount), 
+                    note, 
+                    start: this.reportStart, 
+                    end: this.reportEnd
+                });
+                this.closeModal('adjustment');
+            }
+
+            openLoanModal() { 
+                this.currentLoan = { empId: '', amount: '', date: new Date().toISOString().split('T')[0], note: '' };
+                this.modals.loan = true; 
+                this.render(); 
+            }
+            
+            async saveLoan() {
+                const empId = document.getElementById('loanEmpId').value;
+                const amount = document.getElementById('loanAmount').value;
+                const date = document.getElementById('loanDate').value;
+                const note = document.getElementById('loanNote').value;
+                
+                if (!empId || !amount) return alert('請填寫完整資料');
+                
+                const emp = this.employees.find(e => e.id === empId);
+                const { collection, addDoc } = this.modules;
+                
+                await addDoc(collection(this.db, 'loans'), {
+                    empId, 
+                    empName: emp.name, 
+                    amount: Number(amount), 
+                    date,
+                    note,
+                    timestamp: Date.now()
+                });
+                this.closeModal('loan');
+            }
+
+            async deleteLoan(id) { 
+                if (confirm('確定要刪除此借支記錄？')) {
+                    const { doc, deleteDoc } = this.modules;
+                    await deleteDoc(doc(this.db, 'loans', id)); 
+                }
+            }
+
+            calculateReport() {
+                const start = new Date(this.reportStart);
+                const end = new Date(this.reportEnd);
+                const dates = [];
+                
+                for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                    dates.push(new Date(d).toISOString().split('T')[0]);
+                }
+
+                return this.employees.filter(e => e.status === 'active').map(emp => {
+                    const days = dates.filter(d => this.attendance[emp.id]?.[d]).length;
+                    const base = days * emp.dailyRate;
+                    const adj = this.adjustments[`${this.reportStart}_${this.reportEnd}_${emp.id}`]?.amount || 0;
+                    const empLoans = this.loans.filter(l => l.empId === emp.id && l.date >= this.reportStart && l.date <= this.reportEnd);
+                    const totalL = empLoans.reduce((s, l) => s + l.amount, 0);
+                    
+                    return { 
+                        id: emp.id, 
+                        name: emp.name, 
+                        dailyRate: emp.dailyRate, 
+                        days, 
+                        baseSalary: base, 
+                        adj, 
+                        totalLoans: totalL, 
+                        finalSalary: base + adj - totalL,
+                        empLoans
+                    };
+                });
+            }
+
+            calculateStats() {
+                const yearStart = `${this.statsYear}-01-01`;
+                const yearEnd = `${this.statsYear}-12-31`;
+                const days = [];
+                
+                for (let d = new Date(yearStart); d <= new Date(yearEnd); d.setDate(d.getDate() + 1)) {
+                    days.push(new Date(d).toISOString().split('T')[0]);
+                }
+
+                return this.employees.filter(e => e.status === 'active').map(emp => {
+                    const monthlyData = Array.from({ length: 12 }, (_, i) => {
+                        const month = i + 1;
+                        const monthDays = days.filter(d => {
+                            const [y, m] = d.split('-');
+                            return Number(y) === this.statsYear && Number(m) === month;
+                        });
+                        const workedDays = monthDays.filter(d => this.attendance[emp.id]?.[d]).length;
+                        return { month, days: workedDays };
+                    });
+
+                    const totalDays = monthlyData.reduce((sum, m) => sum + m.days, 0);
+                    return { id: emp.id, name: emp.name, monthlyData, totalDays };
+                });
+            }
+
+            downloadReportExcel() {
+                const data = this.calculateReport();
+                const wsData = [
+                    ['薪資報表'],
+                    [`結算期間: ${this.reportStart} 至 ${this.reportEnd}`],
+                    [],
+                    ['員工姓名', '日薪', '出勤天數', '基本薪資', '調整金額', '借支總額', '實發薪資']
+                ];
+                
+                data.forEach(d => {
+                    wsData.push([d.name, d.dailyRate, d.days, d.baseSalary, d.adj, d.totalLoans, d.finalSalary]);
+                });
+
+                const wb = XLSX.utils.book_new();
+                const ws = XLSX.utils.aoa_to_sheet(wsData);
+                ws['!cols'] = [
+                    { wch: 12 }, { wch: 10 }, { wch: 12 }, 
+                    { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }
+                ];
+                
+                XLSX.utils.book_append_sheet(wb, ws, '薪資報表');
+                XLSX.writeFile(wb, `薪資報表_${this.reportStart}_${this.reportEnd}.xlsx`);
+            }
+
+            downloadStatsExcel() {
+                const data = this.calculateStats();
+                const wsData = [
+                    [`${this.statsYear}年度出勤統計`],
+                    [],
+                    ['員工姓名', '1月', '2月', '3月', '4月', '5月', '6月', '7月', '8月', '9月', '10月', '11月', '12月', '全年總計']
+                ];
+                
+                data.forEach(emp => {
+                    const row = [emp.name];
+                    emp.monthlyData.forEach(m => row.push(m.days));
+                    row.push(emp.totalDays);
+                    wsData.push(row);
+                });
+
+                const wb = XLSX.utils.book_new();
+                const ws = XLSX.utils.aoa_to_sheet(wsData);
+                ws['!cols'] = [
+                    { wch: 12 },
+                    ...Array(12).fill({ wch: 6 }),
+                    { wch: 10 }
+                ];
+                
+                XLSX.utils.book_append_sheet(wb, ws, `${this.statsYear}年統計`);
+                XLSX.writeFile(wb, `年度統計_${this.statsYear}.xlsx`);
+            }
+
+            downloadTemplate() {
+                const wsData = [
+                    ['員工姓名', '日薪'],
+                    ['王小明', 1500],
+                    ['李小華', 1800],
+                    ['張大衛', 2000]
+                ];
+                
+                const wb = XLSX.utils.book_new();
+                const ws = XLSX.utils.aoa_to_sheet(wsData);
+                ws['!cols'] = [{ wch: 12 }, { wch: 10 }];
+                
+                XLSX.utils.book_append_sheet(wb, ws, '員工名單');
+                XLSX.writeFile(wb, '員工匯入範例.xlsx');
+            }
+
+            async handleImport(e) {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                const reader = new FileReader();
+                reader.onload = async (event) => {
+                    try {
+                        const data = new Uint8Array(event.target.result);
+                        const workbook = XLSX.read(data, { type: 'array' });
+                        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+                        const rows = XLSX.utils.sheet_to_json(firstSheet, { header: 1 });
+                        
+                        const { collection, addDoc } = this.modules;
+                        let count = 0;
+                        
+                        for (let i = 1; i < rows.length; i++) {
+                            const [name, rate] = rows[i];
+                            if (name && rate) {
+                                await addDoc(collection(this.db, 'employees'), {
+                                    name: String(name).trim(),
+                                    dailyRate: Number(rate),
+                                    status: 'active',
+                                    createdAt: Date.now()
+                                });
+                                count++;
+                            }
+                        }
+                        
+                        alert(`成功匯入 ${count} 位員工！`);
+                    } catch (err) {
+                        console.error(err);
+                        alert('匯入失敗，請確認檔案格式正確');
+                    }
+                };
+                reader.readAsArrayBuffer(file);
+                e.target.value = '';
+            }
+        }
+
+        let app;
+        window.addEventListener('DOMContentLoaded', () => {
+            setTimeout(() => { 
+                if (window.firebaseDB) {
+                    app = new App(); 
+                }
+            }, 1000);
+        });
+    </script>
+</body>
+</html>
